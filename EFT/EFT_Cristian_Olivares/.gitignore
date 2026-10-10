@@ -1,0 +1,7 @@
+**/target/
+.idea/
+.vscode/
+*.iml
+/batch-service/output/
+/batch-service/state/
+/batch-service/batchdb*

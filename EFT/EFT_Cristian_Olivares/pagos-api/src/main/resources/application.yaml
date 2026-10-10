@@ -1,0 +1,85 @@
+server:
+  port: 8087
+
+spring:
+  application:
+    name: pagos-api
+  config:
+    import: "optional:configserver:http://config-server:8888"
+  datasource:
+    url: jdbc:h2:mem:pagosdb;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  jpa:
+    hibernate:
+      ddl-auto: update
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: http://auth-server:9000
+  kafka:
+    bootstrap-servers: ${SPRING_KAFKA_BOOTSTRAP_SERVERS:kafka:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+    consumer:
+      group-id: pagos-api-group
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.trusted.packages: com.bancoxyz.pagos.model
+        spring.json.value.default.type: com.bancoxyz.pagos.model.PagoProcesadoEvent
+
+app:
+  kafka:
+    topic: pagos-procesados
+    partitions: 3
+    publish-timeout-seconds: 3
+  outbox:
+    fixed-delay-milliseconds: 5000
+
+eureka:
+  client:
+    service-url:
+      defaultZone: ${EUREKA_CLIENT_SERVICEURL_DEFAULTZONE:http://eureka-server:8761/eureka/}
+  instance:
+    prefer-ip-address: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,circuitbreakers,retries
+
+resilience4j:
+  circuitbreaker:
+    instances:
+      paymentEventPublisher:
+        sliding-window-size: 10
+        minimum-number-of-calls: 3
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 10s
+      accountTransfer:
+        sliding-window-size: 10
+        minimum-number-of-calls: 3
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 10s
+        ignore-exceptions:
+          - org.springframework.web.client.RestClientResponseException
+  retry:
+    instances:
+      paymentEventPublisher:
+        max-attempts: 3
+        wait-duration: 1s
+        retry-exceptions:
+          - java.lang.IllegalStateException
+      accountTransfer:
+        max-attempts: 3
+        wait-duration: 500ms
+        retry-exceptions:
+          - org.springframework.web.client.ResourceAccessException
+        ignore-exceptions:
+          - org.springframework.web.client.RestClientResponseException

@@ -1,0 +1,41 @@
+server:
+  port: 9000
+
+spring:
+  application:
+    name: auth-server
+  config:
+    import: "optional:configserver:http://config-server:8888"
+  security:
+    oauth2:
+      authorizationserver:
+        client:
+          bank-client:
+            registration:
+              client-id: "bank-client"
+              client-secret: "{noop}secret"
+              client-authentication-methods:
+                - "client_secret_basic"
+              authorization-grant-types:
+                - "authorization_code"
+                - "refresh_token"
+                - "client_credentials"
+              redirect-uris:
+                - "http://127.0.0.1:8080/login/oauth2/code/bank-client"
+              scopes:
+                - "openid"
+                - "profile"
+                - "read"
+                - "write"
+                - "web.read"
+                - "mobile.read"
+                - "atm.read"
+                - "atm.write"
+            require-authorization-consent: true
+
+eureka:
+  client:
+    service-url:
+      defaultZone: http://eureka-server:8761/eureka/
+  instance:
+    prefer-ip-address: true
