@@ -1,135 +1,241 @@
-# Guía de despliegue en AWS — ECS Fargate
+# Guía de despliegue en AWS — EC2 + Docker Compose
 
-## Alcance y arquitectura elegida
+## 1. Alcance y arquitectura elegida
 
-Las instrucciones de la EFT exigen preparar un despliegue en AWS, pero no fijan
-un servicio específico. Para este proyecto se propone **Amazon ECS Fargate**:
-ECR almacena las imágenes; un Application Load Balancer (ALB) publica los tres
-BFF; ECS Service Discovery/Eureka permite las llamadas internas; MSK reemplaza
-el broker Kafka local; RDS for PostgreSQL entrega persistencia administrada;
-y CloudWatch centraliza logs y métricas.
+Las instrucciones de la EFT piden preparar y desplegar los microservicios en un
+entorno de nube (AWS) usando Docker. Para este proyecto se despliega **toda la
+solución en una instancia Amazon EC2** (Ubuntu 24.04) ejecutando el mismo
+`docker-compose.yaml` que se usa en local:
 
-`docker compose up` es solo el entorno local. No constituye un despliegue en
-AWS ni configura por sí solo HTTPS, balanceo externo, secretos o escalado.
-
-## 1. Requisitos de la cuenta y red
-
-Se necesita una cuenta AWS con permisos para ECR, ECS, EC2/VPC, ELB, IAM,
-Secrets Manager, CloudWatch, RDS y MSK. Configura AWS CLI con un perfil de
-credenciales local y una región:
-
-```powershell
-$AWS_REGION = "us-east-1"
-$AWS_ACCOUNT_ID = aws sts get-caller-identity --query Account --output text
+```text
++-------------------------------------------------------------+
+|               EC2 t3.large (Ubuntu 24.04)                   |
+|            Docker Compose - Red: banco-network              |
+|                                                             |
+|  eureka-server  config-server  auth-server  kafka           |
+|  bank-api       cuentas-api    intereses-api  clientes-api  |
+|  pagos-api      batch-service                               |
+|  bff-web        bff-mobile     bff-atm                      |
++-------------------------------------------------------------+
 ```
 
-No guardes claves de AWS, secretos OAuth ni contraseñas en el repositorio.
+Se eligió EC2 en lugar de ECS Fargate porque el entorno de AWS disponible limita
+los permisos IAM necesarios para ECS, ECR, MSK y RDS, y porque Docker Compose ya
+orquesta los 13 contenedores (12 aplicaciones Spring + Kafka) con sus
+dependencias y healthchecks. La arquitectura de producción recomendada se
+describe en la sección 8.
 
-Prepara:
+## 2. Puertos publicados por servicio
 
-1. Una VPC con subredes públicas para el ALB y al menos dos subredes privadas
-   para las tareas Fargate, RDS y MSK.
-2. Security groups que permitan HTTPS al ALB; tráfico desde el ALB solo a los
-   puertos de los BFF; y tráfico privado entre microservicios, Eureka, Config
-   Server, RDS y MSK según necesidad.
-3. Un certificado ACM para el nombre DNS público y un dominio apuntado al ALB.
-4. Un clúster ECS con roles de ejecución de tareas y de aplicación de mínimo
-   privilegio.
-5. Un clúster MSK accesible desde las subredes privadas.
-6. Un RDS for PostgreSQL accesible solo desde las tareas autorizadas.
-7. Secretos en Secrets Manager para contraseña de RDS, credenciales OAuth y
-   claves de firma JWT.
+El `docker-compose.yaml` publica los siguientes puertos en la instancia EC2:
 
-Los microservicios incluyen el driver PostgreSQL. Configura
-`SPRING_DATASOURCE_URL`, `SPRING_DATASOURCE_USERNAME` y
-`SPRING_DATASOURCE_PASSWORD` en las tareas mediante referencias a secretos.
-Los perfiles Docker Compose mantienen H2 para desarrollo. Antes de una
-operación bancaria real, completa el cambio de esquema y una migración de datos
-controlada; no uses H2 en memoria como persistencia de producción.
+- **bank-api:** 8081 (interno) a 8081 (EC2)
+- **cuentas-api:** 8082 (interno) a 8084 (EC2)
+- **intereses-api:** 8083 (interno) a 8083 (EC2)
+- **batch-service:** 8085 (interno) a 8085 (EC2)
+- **clientes-api:** 8086 (interno) a 8086 (EC2)
+- **pagos-api:** 8087 (interno) a 8087 (EC2)
+- **bff-web:** 8091 (interno) a 8091 (EC2)
+- **bff-mobile:** 8092 (interno) a 8092 (EC2)
+- **bff-atm:** 8093 (interno) a 8093 (EC2)
+- **auth-server:** 9000 (interno) a 9000 (EC2)
+- **eureka-server:** 8761 (interno) a 8761 (EC2)
+- **config-server:** 8888 (interno) a 8888 (EC2)
+- **kafka:** 9092 (interno) a 9092 (EC2)
 
-## 2. Publicar imágenes de contenedor en ECR
+> **Nota sobre batch-service:** Es importante que el mapeo en
+> `docker-compose.yaml` sea explícito (`"8085:8085"`) y no solo `"8085"`. Si se
+> deja solo el puerto interno, Docker asigna un puerto aleatorio en el host (por
+> ejemplo 32769) y las peticiones externas fallan con `ECONNREFUSED`. Este
+> ajuste ya está aplicado en el repositorio.
 
-Crea un repositorio ECR por cada imagen desplegable:
+## 3. Crear la instancia EC2 (consola AWS)
 
-```powershell
-$services = @(
-  "eureka-server", "config-server", "auth-server", "bank-api",
-  "cuentas-api", "clientes-api", "intereses-api", "pagos-api",
-  "batch-service", "bff-web", "bff-mobile", "bff-atm"
-)
+1. Consola AWS, región **us-east-1**, sección **EC2**, botón **Launch instance**.
+2. Configuración:
+   - **Name**: `bancoxyz-eft`
+   - **AMI**: Ubuntu Server 24.04 LTS
+   - **Instance type**: `t3.large` (2 vCPU, 8 GB RAM) como mínimo práctico
+     para la demostración; toda la solución es intensiva en memoria.
+   - **Key pair**: *Proceed without a key pair* (se usará EC2 Instance Connect
+     desde el navegador).
+   - **Storage**: 30 GiB gp3.
+3. **Network settings, Create security group** con estas reglas de entrada:
 
-foreach ($service in $services) {
-  aws ecr create-repository --repository-name $service --region $AWS_REGION
-}
+   - **SSH:** puerto 22, origen Anywhere (0.0.0.0/0) para EC2 Instance Connect.
+   - **Custom TCP:** puerto 8081, origen My IP, para bank-api.
+   - **Custom TCP:** puertos 8083-8087, origen My IP, para cuentas, intereses, batch, clientes y pagos.
+   - **Custom TCP:** puertos 8091-8093, origen My IP, para BFF web, móvil y ATM.
+   - **Custom TCP:** puerto 8761, origen My IP, para el Dashboard de Eureka.
+   - **Custom TCP:** puerto 8888, origen My IP, para Config Server.
+   - **Custom TCP:** puerto 9000, origen My IP, para auth-server (tokens OAuth2).
+   - **Custom TCP:** puerto 9092, origen My IP, para Kafka (opcional, solo para depuración).
 
-$ECR = "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
-aws ecr get-login-password --region $AWS_REGION |
-  docker login --username AWS --password-stdin $ECR
+   Los puertos de aplicación solo se abren a la IP del evaluador/desarrollador,
+   no a Internet completo. Si la IP cambia, se edita la regla.
+4. **Launch instance**. Esperar a que esté `Running` y `2/2 checks passed`.
+5. Seleccionar la instancia, **Connect**, **EC2 Instance Connect**,
+   **Connect**. Se abre una terminal en el navegador.
 
-foreach ($service in $services) {
-  docker build -t "$ECR/$service:eft-s9" ".\$service"
-  docker push "$ECR/$service:eft-s9"
-}
+## 4. Preparar el servidor
+
+Dentro de la terminal de la instancia:
+
+```bash
+# Docker, Docker Compose v2 y Git
+sudo apt-get update
+sudo apt-get install -y docker.io docker-compose-v2 git
+sudo usermod -aG docker $USER
+newgrp docker
+
+# Swap de 2 GB como margen de seguridad de memoria
+sudo fallocate -l 2G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+
+# Verificar
+docker --version
+docker compose version
+free -h
 ```
 
-Si ECR informa que el repositorio ya existe, conserva el repositorio creado y
-continúa con el login/build/push. Para entrega reproducible, usa tags
-inmutables derivados del commit en vez de publicar siempre `eft-s9`.
+## 5. Descargar, construir y levantar el sistema
 
-## 3. Configurar ECS y el ALB
+```bash
+git clone <URL_DEL_REPOSITORIO_GITHUB>
+cd <CARPETA_DEL_REPOSITORIO>
+mkdir -p batch-service/output
 
-1. Crea un servicio ECS Fargate por componente; usa imágenes ECR y subredes
-   privadas. Config Server, Eureka, auth-server, APIs y broker no deben
-   publicarse directamente a Internet.
-2. Configura health checks con `/actuator/health` para los servicios Spring.
-   El ALB debe enviar tráfico solo a BFF saludables.
-3. Crea target groups separados para `bff-web` (8091), `bff-mobile` (8092) y
-   `bff-atm` (8093). Usa listener HTTPS 443 con el certificado ACM y reglas por
-   host o path. Redirige HTTP 80 a HTTPS.
-4. Configura variables de entorno para que las APIs y los BFF usen las URLs
-   internas correctas de Config Server, Eureka y MSK. Las URLs
-   `localhost`/`kafka:9092` de Compose no aplican en AWS.
-5. Conserva la configuración de jobs y eventos; configura el Batch service
-   para leer los CSV desde un volumen EFS montado como
-   `/app/data/legacy` y guardar informes en un volumen durable o enviarlos a
-   S3. El directorio local `batch-service/output` no persiste al reemplazar una
-   tarea Fargate.
-6. Para el acceso interno, configura Eureka con nombres de host privados y
-   health checks. Para alta disponibilidad de producción, despliega y valida
-   Eureka/Config Server con redundancia; la configuración de referencia actual
-   del proyecto está pensada para una topología didáctica pequeña.
-7. Revisa la configuración del Authorization Server: el secreto `{noop}secret`
-   y las claves de desarrollo no son adecuados para producción. Inyecta
-   secretos desde Secrets Manager y configura certificados/llaves de firma
-   durables y rotables. No expongas el issuer interno sin una URL pública y
-   estrategia de validación compatibles con los clientes.
+# Construir imágenes (limitar paralelismo para no agotar memoria)
+docker compose --parallel 1 build
 
-## 4. Despliegue, verificación y escalado
+# Levantar toda la solución
+docker compose up -d
+docker compose ps
+```
 
-Despliega primero la infraestructura compartida (RDS, MSK, Eureka y Config
-Server), luego auth-server, APIs y finalmente los BFF. En ECS, actualiza cada
-servicio a la nueva revisión de task definition y espera el estado `RUNNING`.
+La construcción de las imágenes toma varios minutos (Maven descarga
+dependencias). Después de `up -d`, Eureka y Config Server tardan cerca de 1 a
+2 minutos en quedar saludables; el resto de los servicios arranca cuando sus
+dependencias están listas.
 
-Verifica:
+Obtener la IP pública de la instancia:
 
-- Targets saludables y HTTPS del ALB.
-- Registro/disponibilidad de instancias internas.
-- OAuth 2.0/JWT, permisos por canal y ausencia de endpoints backend públicos.
-- Conexión a PostgreSQL y MSK desde subred privada.
-- Eventos de pagos consumidos y outbox sin acumulación.
-- Ejecución de los tres jobs Spring Batch y persistencia de salidas.
-- Logs, métricas, alarmas y trazabilidad en CloudWatch.
+```bash
+curl -s http://checkip.amazonaws.com
+```
 
-Habilita ECS Service Auto Scaling por CPU/memoria y métricas de solicitudes del
-ALB; define mínimos y máximos por servicio. Para los BFF, escala cada canal por
-separado. No escales réplicas con H2 en memoria: usa PostgreSQL administrado y
-verifica que las operaciones idempotentes y el outbox funcionen con varias
-tareas.
+En adelante se usa `<IP_PUBLICA>`.
 
-## 5. Límites de esta guía
+## 6. Verificación del despliegue
 
-Esta guía documenta la arquitectura y los pasos de preparación, pero no crea
-recursos AWS ni realiza un despliegue. La cuenta, región, permisos, DNS,
-certificado, red y presupuesto deben ser provistos y aprobados por el titular.
-Tampoco reemplaza una revisión de seguridad, gestión de datos personales o
-validación de reglas financieras antes de producción.
+**1. Eureka**
+Abrir `http://<IP_PUBLICA>:8761` y comprobar que aparecen registrados
+`BANK-API`, `CUENTAS-API`, `CLIENTES-API`, `PAGOS-API`, `INTERESES-API`,
+`BATCH-SERVICE`, `BFF-WEB`, `BFF-MOBILE`, `BFF-ATM` y `AUTH-SERVER` en estado
+**UP**.
+
+**2. Contenedores**
+Ejecutar `docker compose ps` y verificar que todos los servicios aparezcan como
+`running` o `healthy`.
+
+**3. Token OAuth2**
+Probar la generación de token desde Postman o curl:
+
+```bash
+curl -s -u bank-client:secret -X POST http://<IP_PUBLICA>:9000/oauth2/token \
+  -d "grant_type=client_credentials" -d "scope=read write"
+```
+
+**4. Pruebas funcionales**
+Seguir `instrucciones.md` reemplazando `localhost` por `<IP_PUBLICA>`. Los
+puertos en la nube son: auth 9000, clientes 8086, cuentas 8084, pagos 8087,
+batch 8085, BFF web 8091, BFF móvil 8092 y BFF ATM 8093.
+
+**5. Kafka**
+Ejecutar `docker compose logs --tail=50 pagos-api` y
+`docker compose logs --tail=50 bank-api` para ver el evento producido y
+consumido.
+
+**6. Batch**
+Después de ejecutar los jobs, `ls batch-service/output` lista los CSV generados.
+
+## 7. Escalabilidad horizontal (trabajo futuro)
+
+Los BFF no guardan estado, por lo que son candidatos naturales a escalar
+horizontalmente. Sin embargo, en el `docker-compose.yaml` actual los tres BFF
+tienen puertos fijos (8091, 8092 y 8093), lo que impide levantar más de un
+contenedor por canal sin colisión de puertos.
+
+Para habilitar la escalabilidad horizontal de los BFF, el siguiente paso sería
+modificar el `docker-compose.yaml` para publicar rangos de puertos:
+
+- **BFF Web:** puerto interno 8091, rango publicado 8191 a 8195.
+- **BFF Móvil:** puerto interno 8092, rango publicado 8201 a 8205.
+- **BFF ATM:** puerto interno 8093, rango publicado 8211 a 8215.
+
+De esta forma, un comando como:
+
+```bash
+docker compose up -d --scale bff-web=2 --no-recreate
+```
+
+levantaría dos réplicas del BFF Web, atendiendo en los puertos 8191 y 8192. El
+balanceo se delegaría a un Application Load Balancer (sección 8).
+
+**Limitación adicional**: las APIs de datos (`clientes-api`, `cuentas-api`,
+`pagos-api`) usan H2 en memoria, por lo que cada réplica tendría su propia copia
+de los datos. Para escalarlas se requiere una base de datos compartida como
+Amazon RDS for PostgreSQL (sección 8).
+
+## 8. Arquitectura recomendada para producción (trabajo futuro)
+
+El proyecto ya incluye el driver de PostgreSQL y usa configuración externa, de
+modo que el paso siguiente es migrar a servicios administrados de AWS:
+
+- **Amazon ECR** para las imágenes y **ECS Fargate** para ejecutar cada servicio
+  con Service Auto Scaling por CPU/memoria.
+- **Application Load Balancer** con HTTPS (certificado ACM) delante de los tres
+  BFF; el resto de los servicios en subredes privadas.
+- **Amazon RDS for PostgreSQL** en lugar de H2, lo que permite escalar también
+  `clientes-api`, `cuentas-api` y `pagos-api`.
+- **Amazon MSK** en lugar del contenedor Kafka.
+- **AWS Secrets Manager** para credenciales OAuth y claves de firma JWT, en
+  reemplazo de `{noop}secret` y de las claves de desarrollo.
+- **CloudWatch** para logs, métricas y alarmas.
+
+## 9. Seguridad y costos
+
+- No se guardan claves de AWS ni secretos en el repositorio.
+- El `client_secret` `secret` y las claves JWT del auth-server son solo para
+  desarrollo/demostración y deben reemplazarse antes de un uso real.
+- Los puertos de aplicación están restringidos por Security Group a una IP
+  específica; el tráfico es HTTP, por lo que en producción se debe añadir HTTPS
+  en un balanceador.
+- Al terminar la evaluación, **detener o terminar la instancia** para evitar
+  costos. Si se detiene y se vuelve a iniciar, la IP pública cambia y los
+  contenedores se levantan con `docker compose up -d`.
+
+## 10. Lecciones aprendidas: troubleshooting del puerto 8085
+
+Durante el despliegue inicial del `batch-service` se detectó un error
+`ECONNREFUSED` al llamar al endpoint `POST /api/v1/batch/annual-statements`
+desde Postman. El diagnóstico fue el siguiente:
+
+1. `docker ps` mostró que el contenedor estaba mapeado a un puerto aleatorio
+   (`0.0.0.0:32769->8085/tcp`) en lugar del 8085 esperado.
+2. La causa era que el `docker-compose.yaml` declaraba `ports: - "8085"` sin el
+   mapeo explícito host:contenedor.
+3. La solución fue cambiar la declaración a `ports: - "8085:8085"`, detener y
+   remover el contenedor, y volver a levantarlo con `docker compose up -d
+   batch-service`.
+4. Se verificó con `docker ps` que el mapeo quedara como
+   `0.0.0.0:8085->8085/tcp` y se repitió la prueba en Postman con resultado
+   `200 OK` y `status: COMPLETED`.
+
+**Conclusión**: en Docker Compose, cuando se quiere exponer un puerto específico
+del contenedor en el mismo puerto del host, siempre se debe declarar en el
+formato `"HOST:CONTENEDOR"`. Dejar solo el número hace que Docker asigne un
+puerto efímero, lo cual es válido para escalabilidad pero rompe las pruebas
+directas contra el puerto conocido.

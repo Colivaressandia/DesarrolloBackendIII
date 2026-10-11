@@ -16,6 +16,8 @@ import org.springframework.batch.core.listener.SkipListener;
 import org.springframework.batch.core.repository.JobRepository;
 import org.springframework.batch.core.step.Step;
 import org.springframework.batch.core.step.builder.StepBuilder;
+import org.springframework.batch.integration.async.AsyncItemProcessor;
+import org.springframework.batch.integration.async.AsyncItemWriter;
 import org.springframework.batch.infrastructure.item.ItemProcessor;
 import org.springframework.batch.infrastructure.item.file.FlatFileItemReader;
 import org.springframework.batch.infrastructure.item.file.builder.FlatFileItemReaderBuilder;
@@ -27,6 +29,7 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.core.io.FileSystemResource;
 import org.springframework.core.io.Resource;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -37,12 +40,27 @@ import java.math.RoundingMode;
 import java.nio.file.Path;
 import java.time.LocalDate;
 import java.time.YearMonth;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadPoolExecutor;
 
 @Configuration
 public class BatchJobsConfiguration {
 
     private static final Logger log = LoggerFactory.getLogger(BatchJobsConfiguration.class);
     private static final int CHUNK_SIZE = 100;
+
+    @Bean
+    ThreadPoolTaskExecutor batchTaskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(2);
+        executor.setMaxPoolSize(4);
+        executor.setQueueCapacity(16);
+        executor.setThreadNamePrefix("batch-worker-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.initialize();
+        return executor;
+    }
 
     @Bean
     SkipListener<Object, Object> batchSkipListener() {
@@ -174,16 +192,64 @@ public class BatchJobsConfiguration {
     }
 
     @Bean
+    @StepScope
+    AsyncItemProcessor<TransactionInput, DailyTransactionRow> asyncDailyTransactionProcessor(
+            @Qualifier("dailyTransactionProcessor") ItemProcessor<TransactionInput, DailyTransactionRow> delegate,
+            @Qualifier("batchTaskExecutor") ThreadPoolTaskExecutor taskExecutor) {
+        return asyncProcessor(delegate, taskExecutor);
+    }
+
+    @Bean
+    @StepScope
+    AsyncItemProcessor<InterestInput, MonthlyInterestRow> asyncMonthlyInterestProcessor(
+            @Qualifier("monthlyInterestProcessor") ItemProcessor<InterestInput, MonthlyInterestRow> delegate,
+            @Qualifier("batchTaskExecutor") ThreadPoolTaskExecutor taskExecutor) {
+        return asyncProcessor(delegate, taskExecutor);
+    }
+
+    @Bean
+    @StepScope
+    AsyncItemProcessor<AnnualAccountInput, AnnualStatementRow> asyncAnnualStatementProcessor(
+            @Qualifier("annualStatementProcessor") ItemProcessor<AnnualAccountInput, AnnualStatementRow> delegate,
+            @Qualifier("batchTaskExecutor") ThreadPoolTaskExecutor taskExecutor) {
+        return asyncProcessor(delegate, taskExecutor);
+    }
+
+    @Bean
+    @StepScope
+    AsyncItemWriter<DailyTransactionRow> asyncDailyTransactionWriter(
+            @Qualifier("dailyTransactionWriter")
+            org.springframework.batch.infrastructure.item.file.FlatFileItemWriter<DailyTransactionRow> delegate) {
+        return new AsyncItemWriter<>(delegate);
+    }
+
+    @Bean
+    @StepScope
+    AsyncItemWriter<MonthlyInterestRow> asyncMonthlyInterestWriter(
+            @Qualifier("monthlyInterestWriter")
+            org.springframework.batch.infrastructure.item.file.FlatFileItemWriter<MonthlyInterestRow> delegate) {
+        return new AsyncItemWriter<>(delegate);
+    }
+
+    @Bean
+    @StepScope
+    AsyncItemWriter<AnnualStatementRow> asyncAnnualStatementWriter(
+            @Qualifier("annualStatementWriter")
+            org.springframework.batch.infrastructure.item.file.FlatFileItemWriter<AnnualStatementRow> delegate) {
+        return new AsyncItemWriter<>(delegate);
+    }
+
+    @Bean
     Step dailyTransactionReportStep(JobRepository repository,
                                     PlatformTransactionManager transactionManager,
                                     @Qualifier("transactionReader") FlatFileItemReader<TransactionInput> reader,
-                                    @Qualifier("dailyTransactionProcessor")
-                                    ItemProcessor<TransactionInput, DailyTransactionRow> processor,
-                                    @Qualifier("dailyTransactionWriter")
-                                    org.springframework.batch.infrastructure.item.file.FlatFileItemWriter<DailyTransactionRow> writer,
+                                    @Qualifier("asyncDailyTransactionProcessor")
+                                    AsyncItemProcessor<TransactionInput, DailyTransactionRow> processor,
+                                    @Qualifier("asyncDailyTransactionWriter")
+                                    AsyncItemWriter<DailyTransactionRow> writer,
                                     SkipListener<Object, Object> batchSkipListener) {
         return new StepBuilder("dailyTransactionReportStep", repository)
-                .<TransactionInput, DailyTransactionRow>chunk(CHUNK_SIZE, transactionManager)
+                .<TransactionInput, Future<DailyTransactionRow>>chunk(CHUNK_SIZE, transactionManager)
                 .reader(reader)
                 .processor(processor)
                 .writer(writer)
@@ -201,13 +267,13 @@ public class BatchJobsConfiguration {
     Step monthlyInterestCalculationStep(JobRepository repository,
                                         PlatformTransactionManager transactionManager,
                                         @Qualifier("interestReader") FlatFileItemReader<InterestInput> reader,
-                                        @Qualifier("monthlyInterestProcessor")
-                                        ItemProcessor<InterestInput, MonthlyInterestRow> processor,
-                                        @Qualifier("monthlyInterestWriter")
-                                        org.springframework.batch.infrastructure.item.file.FlatFileItemWriter<MonthlyInterestRow> writer,
+                                        @Qualifier("asyncMonthlyInterestProcessor")
+                                        AsyncItemProcessor<InterestInput, MonthlyInterestRow> processor,
+                                        @Qualifier("asyncMonthlyInterestWriter")
+                                        AsyncItemWriter<MonthlyInterestRow> writer,
                                         SkipListener<Object, Object> batchSkipListener) {
         return new StepBuilder("monthlyInterestCalculationStep", repository)
-                .<InterestInput, MonthlyInterestRow>chunk(CHUNK_SIZE, transactionManager)
+                .<InterestInput, Future<MonthlyInterestRow>>chunk(CHUNK_SIZE, transactionManager)
                 .reader(reader)
                 .processor(processor)
                 .writer(writer)
@@ -225,13 +291,13 @@ public class BatchJobsConfiguration {
     Step annualStatementGenerationStep(JobRepository repository,
                                        PlatformTransactionManager transactionManager,
                                        @Qualifier("annualAccountReader") FlatFileItemReader<AnnualAccountInput> reader,
-                                       @Qualifier("annualStatementProcessor")
-                                       ItemProcessor<AnnualAccountInput, AnnualStatementRow> processor,
-                                       @Qualifier("annualStatementWriter")
-                                       org.springframework.batch.infrastructure.item.file.FlatFileItemWriter<AnnualStatementRow> writer,
+                                       @Qualifier("asyncAnnualStatementProcessor")
+                                       AsyncItemProcessor<AnnualAccountInput, AnnualStatementRow> processor,
+                                       @Qualifier("asyncAnnualStatementWriter")
+                                       AsyncItemWriter<AnnualStatementRow> writer,
                                        SkipListener<Object, Object> batchSkipListener) {
         return new StepBuilder("annualStatementGenerationStep", repository)
-                .<AnnualAccountInput, AnnualStatementRow>chunk(CHUNK_SIZE, transactionManager)
+                .<AnnualAccountInput, Future<AnnualStatementRow>>chunk(CHUNK_SIZE, transactionManager)
                 .reader(reader)
                 .processor(processor)
                 .writer(writer)
@@ -243,6 +309,13 @@ public class BatchJobsConfiguration {
                 .skipLimit(10000)
                 .listener(batchSkipListener)
                 .build();
+    }
+
+    private static <I, O> AsyncItemProcessor<I, O> asyncProcessor(
+            ItemProcessor<I, O> delegate, ThreadPoolTaskExecutor taskExecutor) {
+        AsyncItemProcessor<I, O> processor = new AsyncItemProcessor<>(delegate);
+        processor.setTaskExecutor(taskExecutor);
+        return processor;
     }
 
     @Bean

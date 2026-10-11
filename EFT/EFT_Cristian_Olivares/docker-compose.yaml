@@ -136,7 +136,7 @@ services:
   batch-service:
     build: ./batch-service
     ports:
-      - "8085"
+      - "8085:8085"
     environment:
       - JAVA_TOOL_OPTIONS=-XX:ActiveProcessorCount=2
       - EUREKA_CLIENT_SERVICEURL_DEFAULTZONE=http://eureka-server:8761/eureka/

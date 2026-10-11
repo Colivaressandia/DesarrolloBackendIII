@@ -2,7 +2,7 @@
 
 ## 1. Requisitos
 
-- Docker Desktop en ejecución y Docker Compose v2.
+- Docker y Docker Compose v2 (en Windows: Docker Desktop; en Linux/EC2: `docker.io` + `docker-compose-v2`).
 - Postman (o una herramienta HTTP equivalente).
 - Java 17 y Maven Wrapper solo si se desea ejecutar un módulo fuera de Docker.
 
@@ -10,14 +10,14 @@
 
 Desde la carpeta raíz del proyecto:
 
-```powershell
+```bash
 docker compose up --build -d
 docker compose ps
 ```
 
 Para evitar que el entorno local sature la máquina al iniciar varios servicios
 Spring simultáneamente, Compose limita cada JVM a dos procesadores. Este ajuste
-solo aplica al desarrollo local y no a las tareas ECS.
+solo aplica al desarrollo local y no al entorno de producción.
 
 Espera a que `eureka-server` y `config-server` estén saludables. Comprueba el
 registro de servicios en `http://localhost:8761`. Los puertos publicados y el
@@ -25,7 +25,7 @@ estado de cada contenedor se pueden consultar con `docker compose ps`.
 
 Para apagar el entorno:
 
-```powershell
+```bash
 docker compose down
 ```
 
@@ -34,9 +34,9 @@ Los archivos generados por Batch quedan en `batch-service/output/`.
 
 ## 3. Obtener tokens OAuth 2.0 por canal
 
-En Postman crea una solicitud `POST` a `http://localhost:9000/oauth2/token`,
-selecciona Basic Auth (`bank-client` / `secret`) y usa
-`application/x-www-form-urlencoded`:
+En Postman crea una solicitud `POST` a `http://localhost:9000/oauth2/token`
+(en EC2: `http://<IP_PUBLICA>:9000/oauth2/token`), selecciona Basic Auth
+(`bank-client` / `secret`) y usa `application/x-www-form-urlencoded`:
 
 ```text
 grant_type=client_credentials
@@ -45,8 +45,10 @@ scope=web.read
 
 Repite la solicitud usando `scope=mobile.read` para el BFF móvil y
 `scope=atm.read atm.write` para el BFF de cajeros. Para consumir directamente
-las APIs legacy existentes o Batch, solicita `scope=read write`. No publiques
-los secretos de desarrollo de este entorno local.
+las APIs legacy existentes o Batch, solicita `scope=read write`.
+
+Las credenciales `bank-client` / `secret` son solo para desarrollo y
+demostración; no deben publicarse ni usarse en un entorno real.
 
 Comprueba que las autorizaciones por canal sean distintas:
 
@@ -141,7 +143,7 @@ datos devuelve el pago existente; reutilizarla con otros datos devuelve
 
 Verifica productor y consumidor:
 
-```powershell
+```bash
 docker compose logs -f pagos-api
 docker compose logs -f kafka
 ```
@@ -165,13 +167,9 @@ descubrimiento Eureka.
 
 ## 8. Ejecutar los jobs Spring Batch
 
-En Docker, consulta el puerto asignado al contenedor:
-
-```powershell
-docker compose port batch-service 8085
-```
-
-Usa ese puerto local para enviar los siguientes `POST` con un token `write`:
+El `batch-service` está publicado en el puerto fijo **8085**. Envía los
+siguientes `POST` con un token `write` a `http://localhost:8085` (o
+`http://<IP_PUBLICA>:8085` en EC2):
 
 ```text
 /api/v1/batch/daily-transactions?date=2024-06-30
@@ -188,9 +186,18 @@ Las tasas mensuales por defecto son `0.005` para ahorro y `0.020` para
 préstamo/hipoteca. Son parámetros demostrativos: el archivo legacy no contiene
 tasas de interés y deben reemplazarse por los valores aprobados para el caso.
 
+Verifica los archivos generados:
+
+```bash
+ls -l batch-service/output/
+head batch-service/output/annual-statements-*.csv
+```
+
 ## 9. Pruebas automatizadas
 
-Ejecuta los tests del módulo desde su carpeta:
+Ejecuta los tests de cada módulo desde su carpeta.
+
+**En Windows (PowerShell):**
 
 ```powershell
 Set-Location .\batch-service
@@ -206,13 +213,59 @@ Set-Location ..\pagos-api
 ..\bank-api\mvnw.cmd -f pom.xml test
 ```
 
-Los BFF se validan con `..\bank-api\mvnw.cmd -f pom.xml test` desde cada una de
-sus carpetas (`bff-web`, `bff-mobile` y `bff-atm`).
+**En Linux/macOS (EC2):**
 
-## 10. Evidencias recomendadas
+```bash
+cd batch-service
+../bank-api/mvnw -f pom.xml test
 
-Guarda capturas de: tokens por canal; rechazo `401`/`403`; apertura y cierre de
-cuentas; creación/idempotencia de pagos; evento recibido desde Kafka; ejecución
-exitosa de cada job y CSV producido; Eureka con los servicios `UP`; y
-`docker compose ps`. Estas capturas complementan, pero no reemplazan, el video
-MP4 de 5 a 7 minutos que grabarás con webcam.
+cd ../clientes-api
+../bank-api/mvnw -f pom.xml test
+
+cd ../cuentas-api
+./mvnw test
+
+cd ../pagos-api
+../bank-api/mvnw -f pom.xml test
+```
+
+Los BFF se validan con `mvnw test` desde cada una de sus carpetas
+(`bff-web`, `bff-mobile` y `bff-atm`).
+
+## 10. Despliegue en AWS EC2
+
+El despliegue en la nube se realizó sobre una instancia **EC2 t3.large**
+(Ubuntu 24.04). Los pasos completos están en `despliegue.md`. Resumen:
+
+1. Crear la instancia EC2 y configurar el Security Group con las reglas de
+   entrada necesarias (8081, 8083-8087, 8091-8093, 8761, 8888, 9000, 9092).
+2. Instalar Docker, Docker Compose v2 y Git.
+3. Clonar el repositorio y ejecutar:
+   ```bash
+   docker compose up -d --build
+   docker compose ps
+   ```
+4. Verificar el dashboard de Eureka en `http://<IP_PUBLICA>:8761` y ejecutar
+   las pruebas de las secciones 3 a 8 reemplazando `localhost` por
+   `<IP_PUBLICA>`.
+
+**Nota sobre el puerto 8085:** En `docker-compose.yaml` el `batch-service`
+debe declarar el mapeo explícito `"8085:8085"`. Si se deja solo `"8085"`,
+Docker asigna un puerto aleatorio y las peticiones externas fallan con
+`ECONNREFUSED`.
+
+## 11. Evidencias recomendadas
+
+Guarda capturas de:
+
+- Tokens por canal (`web.read`, `mobile.read`, `atm.read atm.write`, `read write`).
+- Rechazo `401`/`403` al usar un token en el canal equivocado.
+- Apertura y cierre de cuentas.
+- Creación de pago con idempotencia y repetición de la misma clave.
+- Evento recibido desde Kafka en los logs de `pagos-api`.
+- Ejecución exitosa de cada job de Spring Batch y CSV producido.
+- Dashboard de Eureka con todos los servicios en estado `UP`.
+- `docker compose ps` con todos los contenedores `running`/`healthy`.
+
+Estas capturas complementan, pero no reemplazan, el video MP4 de 5 a 7 minutos
+que grabarás con webcam.
